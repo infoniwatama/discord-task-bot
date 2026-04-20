@@ -1,7 +1,13 @@
-"""Discord channel poller -> Claude task judge -> Google Sheets writer.
+"""Discord PM agent — monitors a channel, creates/updates tasks in Google Sheets.
 
-Runs once per invocation (designed for GitHub Actions cron).
-State (last processed message ID) is stored in a `_state` tab of the same sheet.
+Per cron cycle:
+  1. Resolve any pending approval proposals by reading their reactions.
+  2. Fetch new Discord messages since last processed ID.
+  3. Ask Gemini to classify each message: create / update(high|low) / ignore.
+  4. Apply creates and high-confidence updates directly.
+     Post a Discord approval request for low-confidence updates; resolve next cycle.
+  5. Record every action to `_log`, every rejection to `_rejections` (fed back
+     into future prompts so the model stops repeating the same mistake).
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from google.oauth2.service_account import Credentials
@@ -24,111 +31,422 @@ class RateLimitError(Exception):
 
 DISCORD_API = "https://discord.com/api/v10"
 GEMINI_MODEL = "gemini-2.5-flash-lite"
-GEMINI_MIN_INTERVAL_SEC = 4.5  # free tier ~15 RPM — keep under
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
+GEMINI_MIN_INTERVAL_SEC = 4.5
 JST = timezone(timedelta(hours=9))
+APPROVAL_TIMEOUT_HOURS = 24
+RECENT_REJECTIONS_LIMIT = 20
+APPROVE_EMOJI = "✅"
+REJECT_EMOJI = "❌"
 
 CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 GOOGLE_SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "タスク一覧")
-STATE_SHEET_NAME = "_state"
+MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "タスク管理")
+GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
 
+STATE_SHEET = "_state"
+PENDING_SHEET = "_pending"
+LOG_SHEET = "_log"
+REJECT_SHEET = "_rejections"
 
-SYSTEM_PROMPT = """あなたはDiscordのメッセージを分析し、タスクかどうかを判定するアシスタントです。
+PENDING_HEADER = [
+    "approval_msg_id", "target_task_no", "target_row_index", "changes_json",
+    "proposal_text", "source_msg_id", "source_msg_link", "created_at_iso", "status",
+]
+LOG_HEADER = [
+    "timestamp_jst", "action", "task_no", "changes_json", "source_msg_link", "note",
+]
+REJECT_HEADER = [
+    "timestamp_jst", "source_msg_content", "proposed_changes_json",
+    "target_task_snapshot", "reason",
+]
 
-「タスク」とは、具体的に誰かが実行すべき作業・アクションを示すものです。
-- タスクの例: 「〇〇を修正して」「明日までに資料作成」「バグ直しといて」「〇〇について調査お願い」
-- タスクでない例: 雑談、感想、質問の回答、リンク共有のみ、報告のみ、挨拶
+# main sheet column indexes (1-based)
+COL = {
+    "no": 1, "name": 2, "category": 3, "assignee": 4, "priority": 5,
+    "start": 6, "due": 7, "status": 8, "progress": 9, "done": 10,
+    "comment": 11, "estimated": 12, "actual": 13, "achievement": 14,
+    "memo_todo": 15, "memo_doing": 16, "memo_done": 17, "memo_delay": 18, "memo_hold": 19,
+}
+STATUS_TO_MEMO_COL = {
+    "未着手": COL["memo_todo"],
+    "進行中": COL["memo_doing"],
+    "完了": COL["memo_done"],
+    "遅延": COL["memo_delay"],
+    "保留": COL["memo_hold"],
+}
 
-必ず以下のJSON形式のみで回答してください（前置き・後置き・markdown記法は一切禁止）:
+SYSTEM_PROMPT = """あなたはDiscordメッセージを監視するプロジェクトマネージャーです。
+各メッセージを見て「新規タスク作成 / 既存タスク更新 / 無視」を判断してください。
+
+【分類ルール】
+- create: 新しい依頼・作業指示(まだタスク化されていないもの)
+- update: 既存タスクの進捗報告・完了報告・期限変更・担当変更など
+- ignore: 雑談・挨拶・感想・画像やリンク単独投稿・タスク性のない発言
+
+【confidence 判定(updateの時のみ)】
+- high: タスク番号明示(例「#3」)、タスク名を正確に言及、もしくはリプライで元メッセージが特定可能
+- low: 「あの件」「例の」等の曖昧な言及、複数タスクに当てはまり得る表現
+
+【出力フォーマット(JSONオブジェクトのみ。markdown禁止)】
+共通フィールド:
 {
-  "is_task": true | false,
-  "task_name": "簡潔なタスク名（30文字以内）",
-  "category": "カテゴリ（例: 開発 / 動画編集 / 事務 / 調査 / その他）",
-  "assignee": "担当者（メッセージから読み取れれば。不明なら空文字）",
+  "action": "create" | "update" | "ignore",
+  "reasoning": "20文字以内の判断理由"
+}
+
+create の追加フィールド:
+{
+  "task_name": "30文字以内",
+  "category": "開発/動画編集/事務/調査/営業/その他 等",
+  "assignee": "担当者名(投稿者でよい場合は空文字)",
   "priority": "高" | "中" | "低",
   "start_date": "YYYY-MM-DD または空文字",
   "due_date": "YYYY-MM-DD または空文字",
   "estimated_hours": 数値 または null,
-  "notes": "備考（短く）"
+  "notes": "短い備考"
 }
 
-is_task が false の場合、他のフィールドは空文字や0で構いません。
-日付が「明日」「今週中」など相対表現の場合は、与えられた「今日」の日付を基準に絶対日付へ変換してください。"""
+update の追加フィールド:
+{
+  "confidence": "high" | "low",
+  "target_task_no": 既存タスクの#番号(整数),
+  "changes": {
+    "status": "未着手|進行中|完了|遅延|保留 のいずれか (任意)",
+    "progress": 0〜100の整数 (任意),
+    "assignee": "新担当 (任意)",
+    "due_date": "YYYY-MM-DD (任意)",
+    "actual_hours": 数値 (任意),
+    "note": "このメッセージから追記すべきメモ本文 (任意)"
+  }
+}
+
+ignore の場合は追加フィールド不要。
+
+【重要】
+- 日付の相対表現(明日/今週中など)は「今日」基準で絶対日付に変換
+- 既存タスクリスト・過去の却下例を参考に、誤update提案を避ける
+- target_task_no は必ず既存タスク一覧にある#を指定すること"""
 
 
-def get_sheets_client() -> gspread.Client:
-    creds_info = json.loads(GOOGLE_SA_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return gspread.authorize(creds)
+def headers_discord() -> dict[str, str]:
+    return {"Authorization": f"Bot {DISCORD_TOKEN}"}
 
 
-def get_last_message_id(sh: gspread.Spreadsheet) -> str | None:
-    try:
-        ws = sh.worksheet(STATE_SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=STATE_SHEET_NAME, rows=2, cols=2)
-        ws.update("A1:B1", [["last_message_id", ""]])
-        return None
-    val = ws.acell("B1").value
-    return val or None
+def discord_get(path: str, params: dict | None = None) -> Any:
+    r = requests.get(f"{DISCORD_API}{path}", headers=headers_discord(), params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-def set_last_message_id(sh: gspread.Spreadsheet, message_id: str) -> None:
-    ws = sh.worksheet(STATE_SHEET_NAME)
-    ws.update("A1:B1", [["last_message_id", message_id]])
+def discord_post(path: str, body: dict) -> Any:
+    r = requests.post(f"{DISCORD_API}{path}", headers=headers_discord(), json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def discord_put(path: str) -> None:
+    r = requests.put(f"{DISCORD_API}{path}", headers=headers_discord(), timeout=30)
+    r.raise_for_status()
 
 
 def fetch_new_messages(after_id: str | None) -> list[dict[str, Any]]:
-    """Fetch messages newer than after_id, oldest first."""
-    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
     params: dict[str, Any] = {"limit": 100}
     if after_id:
         params["after"] = after_id
-
-    url = f"{DISCORD_API}/channels/{CHANNEL_ID}/messages"
-    r = requests.get(url, headers=headers, params=params, timeout=30)
-    r.raise_for_status()
-    messages = r.json()
-    # Discord returns newest-first; we want oldest-first for sequential processing
+    messages = discord_get(f"/channels/{CHANNEL_ID}/messages", params=params)
     messages.sort(key=lambda m: int(m["id"]))
     return messages
 
 
-def judge_task(message: dict[str, Any]) -> dict[str, Any]:
-    author = message["author"].get("global_name") or message["author"]["username"]
-    content = message.get("content", "")
+def get_bot_user_id() -> str:
+    me = discord_get("/users/@me")
+    return me["id"]
+
+
+def post_channel_message(content: str) -> dict[str, Any]:
+    return discord_post(f"/channels/{CHANNEL_ID}/messages", {"content": content})
+
+
+def add_reaction(message_id: str, emoji: str) -> None:
+    discord_put(
+        f"/channels/{CHANNEL_ID}/messages/{message_id}/reactions/{quote(emoji, safe='')}/@me"
+    )
+
+
+def get_reaction_user_ids(message_id: str, emoji: str) -> list[str]:
+    users = discord_get(
+        f"/channels/{CHANNEL_ID}/messages/{message_id}/reactions/{quote(emoji, safe='')}"
+    )
+    return [u["id"] for u in users]
+
+
+def message_link(msg: dict[str, Any]) -> str:
+    guild = msg.get("guild_id") or GUILD_ID
+    return f"https://discord.com/channels/{guild}/{msg['channel_id']}/{msg['id']}"
+
+
+def get_sheets_client() -> gspread.Client:
+    info = json.loads(GOOGLE_SA_JSON)
+    creds = Credentials.from_service_account_info(info, scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ])
+    return gspread.authorize(creds)
+
+
+def get_or_create_tab(sh: gspread.Spreadsheet, name: str, header: list[str]) -> gspread.Worksheet:
+    try:
+        ws = sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=100, cols=max(2, len(header)))
+        ws.update(values=[header], range_name=f"A1:{chr(64+len(header))}1")
+        return ws
+    # ensure header exists
+    first_row = ws.row_values(1)
+    if first_row != header:
+        ws.update(values=[header], range_name=f"A1:{chr(64+len(header))}1")
+    return ws
+
+
+def get_last_message_id(state_ws: gspread.Worksheet) -> str | None:
+    val = state_ws.acell("B1").value
+    return val or None
+
+
+def set_last_message_id(state_ws: gspread.Worksheet, message_id: str) -> None:
+    state_ws.update(values=[["last_message_id", message_id]], range_name="A1:B1")
+
+
+def load_tasks_compact(main_ws: gspread.Worksheet) -> list[dict[str, Any]]:
+    """Returns list of dicts for every task row (excluding header)."""
+    values = main_ws.get_all_values()
+    tasks = []
+    for idx, row in enumerate(values[1:], start=2):  # row index in sheet
+        if not row or not row[0]:
+            continue
+        try:
+            task_no = int(row[0])
+        except ValueError:
+            continue
+        tasks.append({
+            "row_index": idx,
+            "no": task_no,
+            "name": row[1] if len(row) > 1 else "",
+            "assignee": row[3] if len(row) > 3 else "",
+            "status": row[7] if len(row) > 7 else "",
+            "progress": row[8] if len(row) > 8 else "",
+            "due": row[6] if len(row) > 6 else "",
+        })
+    return tasks
+
+
+def compact_task_list_for_prompt(tasks: list[dict[str, Any]]) -> str:
+    if not tasks:
+        return "(なし)"
+    lines = []
+    for t in tasks[:50]:  # cap to avoid token bloat; newest are at top
+        lines.append(
+            f"#{t['no']} 『{t['name']}』 担当:{t['assignee'] or '未設定'} "
+            f"状態:{t['status'] or '未着手'} 進捗:{t['progress'] or '0'}% 期限:{t['due'] or '未定'}"
+        )
+    return "\n".join(lines)
+
+
+def load_recent_rejections(reject_ws: gspread.Worksheet, limit: int = RECENT_REJECTIONS_LIMIT) -> list[dict[str, Any]]:
+    values = reject_ws.get_all_values()
+    data = values[1:] if len(values) > 1 else []
+    data.reverse()  # most recent first
+    out = []
+    for row in data[:limit]:
+        if len(row) < 5:
+            continue
+        out.append({
+            "msg": row[1],
+            "proposed": row[2],
+            "target": row[3],
+            "reason": row[4],
+        })
+    return out
+
+
+def rejections_for_prompt(rejections: list[dict[str, Any]]) -> str:
+    if not rejections:
+        return "(なし)"
+    lines = []
+    for r in rejections:
+        lines.append(
+            f"- メッセージ「{r['msg'][:60]}」→ 対象「{r['target'][:40]}」への提案「{r['proposed'][:80]}」→ 却下理由「{r['reason']}」"
+        )
+    return "\n".join(lines)
+
+
+def append_pending(
+    pending_ws: gspread.Worksheet,
+    approval_msg_id: str,
+    task_no: int,
+    row_index: int,
+    changes: dict,
+    proposal_text: str,
+    source_msg_id: str,
+    source_link: str,
+) -> None:
+    now_iso = datetime.now(JST).isoformat()
+    pending_ws.append_row(
+        [approval_msg_id, task_no, row_index, json.dumps(changes, ensure_ascii=False),
+         proposal_text, source_msg_id, source_link, now_iso, "pending"],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def append_log(log_ws: gspread.Worksheet, action: str, task_no: int | str, changes: dict | None,
+               source_link: str, note: str = "") -> None:
+    log_ws.append_row(
+        [datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"), action, task_no,
+         json.dumps(changes or {}, ensure_ascii=False), source_link, note],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def append_rejection(reject_ws: gspread.Worksheet, source_msg: str, changes: dict,
+                     target_snapshot: str, reason: str) -> None:
+    reject_ws.append_row(
+        [datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"), source_msg[:500],
+         json.dumps(changes, ensure_ascii=False), target_snapshot[:200], reason[:200]],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def build_create_row(row_no: int, msg: dict[str, Any], j: dict[str, Any]) -> list[Any]:
+    author = msg["author"].get("global_name") or msg["author"]["username"]
+    assignee = j.get("assignee") or author
+    created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+    created_jst = created_at.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+    link = message_link(msg)
+    comment = (f"[Discord {created_jst}] {msg.get('content','')[:200]}\nlink: {link}").strip()
+    return [
+        row_no,
+        j.get("task_name", ""),
+        j.get("category", ""),
+        assignee,
+        j.get("priority", "中"),
+        j.get("start_date", ""),
+        j.get("due_date", ""),
+        "未着手",
+        0,
+        "",
+        comment,
+        j.get("estimated_hours") or "",
+        "", "",
+        j.get("notes", ""),
+        "", "", "", "",
+    ]
+
+
+def insert_task_at_top(main_ws: gspread.Worksheet, row: list[Any]) -> None:
+    main_ws.insert_row(row, index=2, value_input_option="USER_ENTERED")
+
+
+def next_task_number(main_ws: gspread.Worksheet) -> int:
+    col_a = main_ws.col_values(COL["no"])
+    # header on row1; count numeric entries below
+    nums = [int(v) for v in col_a[1:] if v.strip().isdigit()]
+    return (max(nums) + 1) if nums else 1
+
+
+def current_row_index_for_task(main_ws: gspread.Worksheet, task_no: int) -> int | None:
+    col_a = main_ws.col_values(COL["no"])
+    for i, v in enumerate(col_a, start=1):
+        if v.strip().isdigit() and int(v) == task_no:
+            return i
+    return None
+
+
+def apply_changes_to_row(main_ws: gspread.Worksheet, row_index: int, changes: dict) -> dict:
+    """Applies each change via individual cell updates. Returns dict of applied changes."""
+    applied: dict[str, Any] = {}
+    current = main_ws.row_values(row_index)
+    def getcol(c: int) -> str:
+        return current[c-1] if len(current) >= c else ""
+
+    if "status" in changes:
+        new_status = changes["status"]
+        main_ws.update_cell(row_index, COL["status"], new_status)
+        applied["status"] = new_status
+        if new_status == "完了":
+            today = datetime.now(JST).strftime("%Y-%m-%d")
+            main_ws.update_cell(row_index, COL["done"], today)
+            applied["done_date"] = today
+            # if progress not explicitly set, push to 100
+            if "progress" not in changes:
+                main_ws.update_cell(row_index, COL["progress"], 100)
+                applied["progress"] = 100
+
+    if "progress" in changes:
+        main_ws.update_cell(row_index, COL["progress"], changes["progress"])
+        applied["progress"] = changes["progress"]
+
+    if "assignee" in changes and changes["assignee"]:
+        main_ws.update_cell(row_index, COL["assignee"], changes["assignee"])
+        applied["assignee"] = changes["assignee"]
+
+    if "due_date" in changes and changes["due_date"]:
+        main_ws.update_cell(row_index, COL["due"], changes["due_date"])
+        applied["due_date"] = changes["due_date"]
+
+    if "actual_hours" in changes and changes["actual_hours"] is not None:
+        main_ws.update_cell(row_index, COL["actual"], changes["actual_hours"])
+        applied["actual_hours"] = changes["actual_hours"]
+
+    if "note" in changes and changes["note"]:
+        # Append to memo column matching new status (or current status)
+        status_for_memo = changes.get("status") or getcol(COL["status"]) or "未着手"
+        memo_col = STATUS_TO_MEMO_COL.get(status_for_memo, COL["memo_todo"])
+        existing = getcol(memo_col)
+        stamp = datetime.now(JST).strftime("%m/%d")
+        new_memo = (existing + ("\n" if existing else "") + f"[{stamp}] {changes['note']}").strip()
+        main_ws.update_cell(row_index, memo_col, new_memo)
+        applied["memo_added"] = changes["note"]
+
+    return applied
+
+
+# === Gemini ===
+
+
+def judge_message(
+    msg: dict[str, Any],
+    tasks_prompt: str,
+    rejections_prompt: str,
+) -> dict[str, Any]:
+    author = msg["author"].get("global_name") or msg["author"]["username"]
+    content = msg.get("content", "")
     today = datetime.now(JST).strftime("%Y-%m-%d")
+    ref = msg.get("referenced_message")
+    ref_info = ""
+    if ref:
+        ref_author = ref.get("author", {}).get("global_name") or ref.get("author", {}).get("username", "不明")
+        ref_info = f"\n(このメッセージは {ref_author} の『{(ref.get('content') or '')[:80]}』へのリプライです)"
 
     user_prompt = (
         f"今日の日付: {today}\n"
         f"投稿者: {author}\n"
-        f"メッセージ本文:\n{content}"
+        f"--- 既存タスク一覧(新しい順) ---\n{tasks_prompt}\n"
+        f"--- 過去に却下された提案(同じ誤りを避けるための参考) ---\n{rejections_prompt}\n"
+        f"--- 判定対象メッセージ ---\n{content}{ref_info}"
     )
 
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0,
-        },
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
-    r = requests.post(
-        GEMINI_URL,
-        params={"key": GEMINI_API_KEY},
-        json=body,
-        timeout=30,
-    )
+    r = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=30)
     if r.status_code == 429:
         raise RateLimitError(r.text)
     r.raise_for_status()
@@ -140,119 +458,222 @@ def judge_task(message: dict[str, Any]) -> dict[str, Any]:
             text = text[4:]
         text = text.strip()
     parsed = json.loads(text)
-    # Gemini occasionally wraps the object in a list
     if isinstance(parsed, list):
-        parsed = parsed[0] if parsed else {"is_task": False}
+        parsed = parsed[0] if parsed else {"action": "ignore"}
     return parsed
 
 
-def next_row_number(ws: gspread.Worksheet) -> int:
-    col_a = ws.col_values(1)
-    # Header on row 1; data starts row 2
-    return max(0, len(col_a) - 1) + 1
+# === Main flow ===
 
 
-def append_task_row(
-    ws: gspread.Worksheet,
-    judgement: dict[str, Any],
-    message: dict[str, Any],
+def process_pending_approvals(
+    sh: gspread.Spreadsheet,
+    main_ws: gspread.Worksheet,
+    pending_ws: gspread.Worksheet,
+    log_ws: gspread.Worksheet,
+    reject_ws: gspread.Worksheet,
+    bot_user_id: str,
 ) -> None:
-    row_no = next_row_number(ws)
-    author = message["author"].get("global_name") or message["author"]["username"]
-    assignee = judgement.get("assignee") or author
-    created_at = datetime.fromisoformat(message["timestamp"].replace("Z", "+00:00"))
-    created_jst = created_at.astimezone(JST).strftime("%Y-%m-%d %H:%M")
-    msg_url = (
-        f"https://discord.com/channels/{message['guild_id']}/"
-        f"{message['channel_id']}/{message['id']}"
-        if message.get("guild_id")
-        else ""
-    )
-    comment = (
-        f"[Discord {created_jst}] {message.get('content', '')[:200]}\n"
-        f"link: {msg_url}"
-    ).strip()
+    values = pending_ws.get_all_values()
+    now = datetime.now(JST)
+    for i, row in enumerate(values[1:], start=2):
+        if len(row) < len(PENDING_HEADER):
+            continue
+        if row[8] != "pending":
+            continue
+        approval_msg_id = row[0]
+        try:
+            task_no = int(row[1])
+        except ValueError:
+            continue
+        target_row_index = int(row[2]) if row[2].isdigit() else None
+        try:
+            changes = json.loads(row[3]) if row[3] else {}
+        except json.JSONDecodeError:
+            changes = {}
+        source_link = row[6]
+        created_at = datetime.fromisoformat(row[7]) if row[7] else now
 
-    row = [
-        row_no,                              # A: #
-        judgement.get("task_name", ""),       # B: タスク名
-        judgement.get("category", ""),        # C: カテゴリ
-        assignee,                             # D: 担当者
-        judgement.get("priority", "中"),       # E: 優先度
-        judgement.get("start_date", ""),      # F: 開始日
-        judgement.get("due_date", ""),        # G: 期限日
-        "未着手",                              # H: ステータス
-        0,                                    # I: 進捗(%)
-        "",                                   # J: 完了日
-        comment,                              # K: コメント・備考
-        judgement.get("estimated_hours") or "",  # L: 工数(h)
-        "",                                   # M: 実績(h)
-        "",                                   # N: 達成率
-        judgement.get("notes", ""),           # O: 未着手メモ
-        "",                                   # P: 進行中メモ
-        "",                                   # Q: 完了メモ
-        "",                                   # R: 遅延メモ
-        "",                                   # S: 保留メモ
-    ]
-    # Insert at row 2 so newest tasks appear at the top (below the header row)
-    ws.insert_row(row, index=2, value_input_option="USER_ENTERED")
+        approvers = [uid for uid in get_reaction_user_ids(approval_msg_id, APPROVE_EMOJI) if uid != bot_user_id]
+        rejectors = [uid for uid in get_reaction_user_ids(approval_msg_id, REJECT_EMOJI) if uid != bot_user_id]
+
+        if approvers:
+            if target_row_index is None:
+                target_row_index = current_row_index_for_task(main_ws, task_no)
+            if target_row_index:
+                applied = apply_changes_to_row(main_ws, target_row_index, changes)
+                pending_ws.update_cell(i, 9, "approved")
+                append_log(log_ws, "update_approved", task_no, applied, source_link, f"approved by {approvers[0]}")
+                print(f"[approved] #{task_no} applied: {applied}")
+            else:
+                pending_ws.update_cell(i, 9, "error_row_missing")
+                append_log(log_ws, "update_error", task_no, changes, source_link, "target row not found")
+        elif rejectors:
+            pending_ws.update_cell(i, 9, "rejected")
+            # snapshot of task for learning context
+            snapshot = ""
+            if target_row_index is None:
+                target_row_index = current_row_index_for_task(main_ws, task_no)
+            if target_row_index:
+                snap_row = main_ws.row_values(target_row_index)
+                snapshot = f"#{task_no} {snap_row[1] if len(snap_row)>1 else ''} 状態{snap_row[7] if len(snap_row)>7 else ''}"
+            # pull original source content if possible
+            source_content = row[4][:200]  # proposal_text also contains context
+            append_rejection(reject_ws, source_content, changes, snapshot,
+                             reason=f"rejected by {rejectors[0]}")
+            append_log(log_ws, "update_rejected", task_no, changes, source_link, f"rejected by {rejectors[0]}")
+            print(f"[rejected] #{task_no} changes discarded")
+        else:
+            age_hours = (now - created_at).total_seconds() / 3600
+            if age_hours >= APPROVAL_TIMEOUT_HOURS:
+                pending_ws.update_cell(i, 9, "expired")
+                append_log(log_ws, "update_expired", task_no, changes, source_link,
+                           f"no reaction within {APPROVAL_TIMEOUT_HOURS}h")
+                print(f"[expired] #{task_no}")
 
 
-def main() -> None:
-    sh = get_sheets_client().open_by_key(SPREADSHEET_ID)
-    main_ws = sh.worksheet(MAIN_SHEET_NAME)
+def format_changes_japanese(changes: dict) -> str:
+    labels = {
+        "status": "ステータス",
+        "progress": "進捗",
+        "assignee": "担当者",
+        "due_date": "期限日",
+        "actual_hours": "実績(h)",
+        "note": "メモ追記",
+    }
+    parts = []
+    for k, v in changes.items():
+        name = labels.get(k, k)
+        parts.append(f"・{name}: {v}")
+    return "\n".join(parts) if parts else "(変更なし)"
 
-    last_id = get_last_message_id(sh)
+
+def process_new_messages(
+    sh: gspread.Spreadsheet,
+    main_ws: gspread.Worksheet,
+    state_ws: gspread.Worksheet,
+    pending_ws: gspread.Worksheet,
+    log_ws: gspread.Worksheet,
+    reject_ws: gspread.Worksheet,
+    bot_user_id: str,
+) -> None:
+    last_id = get_last_message_id(state_ws)
     messages = fetch_new_messages(last_id)
-
     if not messages:
         print("No new messages.")
         return
 
     print(f"Fetched {len(messages)} new message(s). Last seen: {last_id}")
 
-    progress_id = last_id  # advances only on successfully processed messages
+    tasks = load_tasks_compact(main_ws)
+    rejections = load_recent_rejections(reject_ws)
+    tasks_prompt = compact_task_list_for_prompt(tasks)
+    rejections_prompt = rejections_for_prompt(rejections)
+
+    progress_id = last_id
     last_api_call = 0.0
 
     for msg in messages:
-        # Skip bot messages (including self) to avoid loops
+        mid = msg["id"]
         if msg["author"].get("bot"):
-            progress_id = msg["id"]
+            progress_id = mid
             continue
         content = (msg.get("content") or "").strip()
         if not content:
-            progress_id = msg["id"]
+            progress_id = mid
             continue
 
-        # rate limit guard
         wait = GEMINI_MIN_INTERVAL_SEC - (time.time() - last_api_call)
         if wait > 0:
             time.sleep(wait)
 
         try:
-            j = judge_task(msg)
+            j = judge_message(msg, tasks_prompt, rejections_prompt)
             last_api_call = time.time()
         except RateLimitError as e:
-            print(f"[rate limit] stop at {msg['id']}: {e}", file=sys.stderr)
-            break  # keep progress_id at prior msg so we retry this one next run
+            print(f"[rate limit] stop at {mid}: {e}", file=sys.stderr)
+            break
         except Exception as e:
-            print(f"[judge error] {msg['id']}: {e}", file=sys.stderr)
-            progress_id = msg["id"]  # unrecoverable; skip to avoid infinite loop
+            print(f"[judge error] {mid}: {e}", file=sys.stderr)
+            progress_id = mid
             continue
 
-        if j.get("is_task"):
-            try:
-                append_task_row(main_ws, j, msg)
-                print(f"[TASK] {msg['id']}: {j.get('task_name')}")
-            except Exception as e:
-                print(f"[sheet error] {msg['id']}: {e}", file=sys.stderr)
+        action = j.get("action")
+        link = message_link(msg)
+
+        if action == "create":
+            row_no = next_task_number(main_ws)
+            row = build_create_row(row_no, msg, j)
+            insert_task_at_top(main_ws, row)
+            append_log(log_ws, "create", row_no, {"name": j.get("task_name")}, link,
+                       j.get("reasoning", ""))
+            print(f"[CREATE] #{row_no}: {j.get('task_name')}")
+            # refresh compact list so later messages see it
+            tasks = load_tasks_compact(main_ws)
+            tasks_prompt = compact_task_list_for_prompt(tasks)
+
+        elif action == "update":
+            target_no = j.get("target_task_no")
+            changes = j.get("changes") or {}
+            confidence = j.get("confidence", "low")
+            row_index = current_row_index_for_task(main_ws, int(target_no)) if target_no else None
+
+            if not row_index:
+                append_log(log_ws, "update_skipped", target_no or "?", changes, link,
+                           "target task not found")
+                print(f"[skip] update target #{target_no} not found")
+            elif confidence == "high":
+                applied = apply_changes_to_row(main_ws, row_index, changes)
+                append_log(log_ws, "update_auto", target_no, applied, link,
+                           j.get("reasoning", ""))
+                print(f"[UPDATE-AUTO] #{target_no}: {applied}")
+                tasks = load_tasks_compact(main_ws)
+                tasks_prompt = compact_task_list_for_prompt(tasks)
+            else:
+                # request approval
+                task_name = next((t["name"] for t in tasks if t["no"] == int(target_no)), "?")
+                proposal_text = (
+                    f"🔔 タスク更新提案 (#{target_no}「{task_name}」)\n"
+                    f"変更内容:\n{format_changes_japanese(changes)}\n"
+                    f"{APPROVE_EMOJI} 承認 / {REJECT_EMOJI} 却下 ({APPROVAL_TIMEOUT_HOURS}h以内)\n"
+                    f"元発言: {link}\n"
+                    f"判断理由: {j.get('reasoning','')}"
+                )
+                try:
+                    posted = post_channel_message(proposal_text)
+                    add_reaction(posted["id"], APPROVE_EMOJI)
+                    add_reaction(posted["id"], REJECT_EMOJI)
+                    append_pending(pending_ws, posted["id"], int(target_no), row_index,
+                                   changes, proposal_text, mid, link)
+                    append_log(log_ws, "update_proposed", target_no, changes, link,
+                               j.get("reasoning", ""))
+                    print(f"[PROPOSE] #{target_no} awaiting approval (msg {posted['id']})")
+                except Exception as e:
+                    append_log(log_ws, "propose_error", target_no, changes, link, str(e))
+                    print(f"[propose error] #{target_no}: {e}", file=sys.stderr)
+
         else:
-            print(f"[skip] {msg['id']}: not a task")
-        progress_id = msg["id"]
+            print(f"[ignore] {mid}: {j.get('reasoning','')}")
+
+        progress_id = mid
 
     if progress_id and progress_id != last_id:
-        set_last_message_id(sh, progress_id)
+        set_last_message_id(state_ws, progress_id)
         print(f"Updated last_message_id -> {progress_id}")
+
+
+def main() -> None:
+    sh = get_sheets_client().open_by_key(SPREADSHEET_ID)
+    main_ws = sh.worksheet(MAIN_SHEET_NAME)
+    state_ws = get_or_create_tab(sh, STATE_SHEET, ["last_message_id", ""])
+    pending_ws = get_or_create_tab(sh, PENDING_SHEET, PENDING_HEADER)
+    log_ws = get_or_create_tab(sh, LOG_SHEET, LOG_HEADER)
+    reject_ws = get_or_create_tab(sh, REJECT_SHEET, REJECT_HEADER)
+
+    bot_user_id = get_bot_user_id()
+
+    process_pending_approvals(sh, main_ws, pending_ws, log_ws, reject_ws, bot_user_id)
+    process_new_messages(sh, main_ws, state_ws, pending_ws, log_ws, reject_ws, bot_user_id)
 
 
 if __name__ == "__main__":
