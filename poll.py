@@ -194,7 +194,8 @@ def append_task_row(
         "",                                   # R: 遅延メモ
         "",                                   # S: 保留メモ
     ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    # Insert at row 2 so newest tasks appear at the top (below the header row)
+    ws.insert_row(row, index=2, value_input_option="USER_ENTERED")
 
 
 def main() -> None:
