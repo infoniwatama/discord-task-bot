@@ -344,16 +344,26 @@ def build_create_row(row_no: int, msg: dict[str, Any], j: dict[str, Any]) -> lis
     author = msg["author"].get("global_name") or msg["author"]["username"]
     assignee = j.get("assignee") or author
     created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
-    created_jst = created_at.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+    created_jst = created_at.astimezone(JST)
+    posted_date = created_jst.strftime("%Y-%m-%d")
+    stamp = created_jst.strftime("%m/%d %H:%M")
     link = message_link(msg)
-    comment = (f"[Discord {created_jst}] {msg.get('content','')[:200]}\nlink: {link}").strip()
+    content_excerpt = (msg.get("content") or "")[:300]
+    comment = (
+        f"━━━ {stamp} @{author} ━━━\n"
+        f"{content_excerpt}\n"
+        f"🔗 {link}"
+    )
+    todo_memo = ""
+    if j.get("notes"):
+        todo_memo = f"[{stamp} @{author}] {j['notes']}"
     return [
         row_no,
         j.get("task_name", ""),
         j.get("category", ""),
         assignee,
         j.get("priority", "中"),
-        j.get("start_date", ""),
+        posted_date,                   # F: 開始日 = 投稿日
         j.get("due_date", ""),
         "未着手",
         0,
@@ -361,7 +371,7 @@ def build_create_row(row_no: int, msg: dict[str, Any], j: dict[str, Any]) -> lis
         comment,
         j.get("estimated_hours") or "",
         "", "",
-        j.get("notes", ""),
+        todo_memo,
         "", "", "", "",
     ]
 
@@ -387,8 +397,14 @@ def current_row_index_for_task(main_ws: gspread.Worksheet, task_no: int) -> int 
     return None
 
 
-def apply_changes_to_row(main_ws: gspread.Worksheet, row_index: int, changes: dict) -> dict:
-    """Applies each change via individual cell updates. Returns dict of applied changes."""
+def apply_changes_to_row(
+    main_ws: gspread.Worksheet,
+    row_index: int,
+    changes: dict,
+    source: dict | None = None,
+) -> dict:
+    """Applies each change via individual cell updates. Returns dict of applied changes.
+    `source` may include {author, link, stamp} to annotate the memo entry."""
     applied: dict[str, Any] = {}
     current = main_ws.row_values(row_index)
     def getcol(c: int) -> str:
@@ -424,12 +440,18 @@ def apply_changes_to_row(main_ws: gspread.Worksheet, row_index: int, changes: di
         applied["actual_hours"] = changes["actual_hours"]
 
     if "note" in changes and changes["note"]:
-        # Append to memo column matching new status (or current status)
         status_for_memo = changes.get("status") or getcol(COL["status"]) or "未着手"
         memo_col = STATUS_TO_MEMO_COL.get(status_for_memo, COL["memo_todo"])
         existing = getcol(memo_col)
-        stamp = datetime.now(JST).strftime("%m/%d")
-        new_memo = (existing + ("\n" if existing else "") + f"[{stamp}] {changes['note']}").strip()
+        src = source or {}
+        author = src.get("author", "")
+        link = src.get("link", "")
+        stamp = src.get("stamp") or datetime.now(JST).strftime("%m/%d %H:%M")
+        header = f"[{stamp}" + (f" @{author}" if author else "") + "]"
+        entry = f"{header} {changes['note']}"
+        if link:
+            entry += f"\n  🔗 {link}"
+        new_memo = (existing + ("\n\n" if existing else "") + entry).strip()
         main_ws.update_cell(row_index, memo_col, new_memo)
         applied["memo_added"] = changes["note"]
 
@@ -523,7 +545,9 @@ def process_pending_approvals(
             if target_row_index is None:
                 target_row_index = current_row_index_for_task(main_ws, task_no)
             if target_row_index:
-                applied = apply_changes_to_row(main_ws, target_row_index, changes)
+                source = {"author": "", "link": source_link,
+                          "stamp": datetime.now(JST).strftime("%m/%d %H:%M")}
+                applied = apply_changes_to_row(main_ws, target_row_index, changes, source=source)
                 pending_ws.update_cell(i, STATUS_COL, "approved")
                 append_log(log_ws, "update_approved", task_no, applied, source_link, f"approved by {approvers[0]}")
                 print(f"[approved] #{task_no} applied: {applied}")
@@ -643,7 +667,11 @@ def process_new_messages(
                            "target task not found")
                 print(f"[skip] update target #{target_no} not found")
             elif confidence == "high":
-                applied = apply_changes_to_row(main_ws, row_index, changes)
+                src_author = msg["author"].get("global_name") or msg["author"]["username"]
+                created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+                stamp = created_at.astimezone(JST).strftime("%m/%d %H:%M")
+                source = {"author": src_author, "link": link, "stamp": stamp}
+                applied = apply_changes_to_row(main_ws, row_index, changes, source=source)
                 append_log(log_ws, "update_auto", target_no, applied, link,
                            j.get("reasoning", ""))
                 print(f"[UPDATE-AUTO] #{target_no}: {applied}")
