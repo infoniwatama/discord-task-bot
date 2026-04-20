@@ -84,7 +84,8 @@ STATUS_TO_MEMO_COL = {
 }
 
 SYSTEM_PROMPT = """あなたはDiscordメッセージを監視するプロジェクトマネージャーです。
-各メッセージを見て「新規タスク作成 / 既存タスク更新 / 無視」を判断してください。
+1つのメッセージに **複数の話題** が含まれることがあるので、
+各話題を個別のアクションに分解してください(create 2件+update 1件 なども可)。
 
 【分類ルール】
 - create: 新しい依頼・作業指示(まだタスク化されていないもの)
@@ -95,27 +96,34 @@ SYSTEM_PROMPT = """あなたはDiscordメッセージを監視するプロジェ
 - high: タスク番号明示(例「#3」)、タスク名を正確に言及、もしくはリプライで元メッセージが特定可能
 - low: 「あの件」「例の」等の曖昧な言及、複数タスクに当てはまり得る表現
 
-【出力フォーマット(JSONオブジェクトのみ。markdown禁止)】
-共通フィールド:
+【出力フォーマット】
+必ず以下のJSON構造**のみ**を返す(markdown・前置き禁止):
 {
-  "action": "create" | "update" | "ignore",
-  "reasoning": "20文字以内の判断理由"
+  "actions": [ アクション1, アクション2, ... ]
 }
 
-create の追加フィールド:
+メッセージ全体がタスク性なしなら `{"actions": [{"action":"ignore","reasoning":"..."}]}` とする。
+複数タスクが含まれるメッセージは配列に複数要素を入れる。
+
+【各アクションのフィールド】
+
+create:
 {
+  "action": "create",
+  "reasoning": "20文字以内",
   "task_name": "30文字以内",
   "category": "開発/動画編集/事務/調査/営業/その他 等",
   "assignee": "担当者名(投稿者でよい場合は空文字)",
   "priority": "高" | "中" | "低",
-  "start_date": "YYYY-MM-DD または空文字",
   "due_date": "YYYY-MM-DD または空文字",
   "estimated_hours": 数値 または null,
   "notes": "短い備考"
 }
 
-update の追加フィールド:
+update:
 {
+  "action": "update",
+  "reasoning": "20文字以内",
   "confidence": "high" | "low",
   "target_task_no": 既存タスクの#番号(整数),
   "changes": {
@@ -128,12 +136,14 @@ update の追加フィールド:
   }
 }
 
-ignore の場合は追加フィールド不要。
+ignore:
+{"action":"ignore","reasoning":"20文字以内"}
 
 【重要】
+- 1メッセージで話題が複数(例「A作って、Bも修正して、C完了した」)なら必ず分割
 - 日付の相対表現(明日/今週中など)は「今日」基準で絶対日付に変換
 - 既存タスクリスト・過去の却下例を参考に、誤update提案を避ける
-- target_task_no は必ず既存タスク一覧にある#を指定すること"""
+- target_task_no は必ず既存タスク一覧にある#を指定"""
 
 
 def headers_discord() -> dict[str, str]:
@@ -500,9 +510,19 @@ def judge_message(
             text = text[4:]
         text = text.strip()
     parsed = json.loads(text)
+    # Normalise to {"actions": [...]}
     if isinstance(parsed, list):
-        parsed = parsed[0] if parsed else {"action": "ignore"}
-    return parsed
+        actions = parsed
+    elif isinstance(parsed, dict):
+        if "actions" in parsed and isinstance(parsed["actions"], list):
+            actions = parsed["actions"]
+        elif "action" in parsed:
+            actions = [parsed]  # legacy single-action shape
+        else:
+            actions = [{"action": "ignore", "reasoning": "unparseable"}]
+    else:
+        actions = [{"action": "ignore", "reasoning": "unparseable"}]
+    return {"actions": actions}
 
 
 # === Main flow ===
@@ -642,67 +662,69 @@ def process_new_messages(
             progress_id = mid
             continue
 
-        action = j.get("action")
         link = message_link(msg)
+        actions = j.get("actions") or [{"action": "ignore", "reasoning": "no actions"}]
+        tasks_changed = False
 
-        if action == "create":
-            row_no = next_task_number(main_ws)
-            row = build_create_row(row_no, msg, j)
-            insert_task_at_top(main_ws, row)
-            append_log(log_ws, "create", row_no, {"name": j.get("task_name")}, link,
-                       j.get("reasoning", ""))
-            print(f"[CREATE] #{row_no}: {j.get('task_name')}")
-            # refresh compact list so later messages see it
+        for a in actions:
+            action = a.get("action")
+            if action == "create":
+                row_no = next_task_number(main_ws)
+                row = build_create_row(row_no, msg, a)
+                insert_task_at_top(main_ws, row)
+                append_log(log_ws, "create", row_no, {"name": a.get("task_name")}, link,
+                           a.get("reasoning", ""))
+                print(f"[CREATE] #{row_no}: {a.get('task_name')}")
+                tasks_changed = True
+
+            elif action == "update":
+                target_no = a.get("target_task_no")
+                changes = a.get("changes") or {}
+                confidence = a.get("confidence", "low")
+                row_index = current_row_index_for_task(main_ws, int(target_no)) if target_no else None
+
+                if not row_index:
+                    append_log(log_ws, "update_skipped", target_no or "?", changes, link,
+                               "target task not found")
+                    print(f"[skip] update target #{target_no} not found")
+                elif confidence == "high":
+                    src_author = msg["author"].get("global_name") or msg["author"]["username"]
+                    created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+                    stamp = created_at.astimezone(JST).strftime("%m/%d %H:%M")
+                    source = {"author": src_author, "link": link, "stamp": stamp}
+                    applied = apply_changes_to_row(main_ws, row_index, changes, source=source)
+                    append_log(log_ws, "update_auto", target_no, applied, link,
+                               a.get("reasoning", ""))
+                    print(f"[UPDATE-AUTO] #{target_no}: {applied}")
+                    tasks_changed = True
+                else:
+                    task_name = next((t["name"] for t in tasks if t["no"] == int(target_no)), "?")
+                    proposal_text = (
+                        f"🔔 タスク更新提案 (#{target_no}「{task_name}」)\n"
+                        f"変更内容:\n{format_changes_japanese(changes)}\n"
+                        f"{APPROVE_EMOJI} 承認 / {REJECT_EMOJI} 却下 ({APPROVAL_TIMEOUT_HOURS}h以内)\n"
+                        f"元発言: {link}\n"
+                        f"判断理由: {a.get('reasoning','')}"
+                    )
+                    try:
+                        posted = post_channel_message(APPROVAL_CHANNEL_ID, proposal_text)
+                        add_reaction(APPROVAL_CHANNEL_ID, posted["id"], APPROVE_EMOJI)
+                        add_reaction(APPROVAL_CHANNEL_ID, posted["id"], REJECT_EMOJI)
+                        append_pending(pending_ws, posted["id"], APPROVAL_CHANNEL_ID,
+                                       int(target_no), row_index, changes, proposal_text,
+                                       mid, link)
+                        append_log(log_ws, "update_proposed", target_no, changes, link,
+                                   a.get("reasoning", ""))
+                        print(f"[PROPOSE] #{target_no} awaiting approval (msg {posted['id']})")
+                    except Exception as e:
+                        append_log(log_ws, "propose_error", target_no, changes, link, str(e))
+                        print(f"[propose error] #{target_no}: {e}", file=sys.stderr)
+            else:
+                print(f"[ignore] {mid}: {a.get('reasoning','')}")
+
+        if tasks_changed:
             tasks = load_tasks_compact(main_ws)
             tasks_prompt = compact_task_list_for_prompt(tasks)
-
-        elif action == "update":
-            target_no = j.get("target_task_no")
-            changes = j.get("changes") or {}
-            confidence = j.get("confidence", "low")
-            row_index = current_row_index_for_task(main_ws, int(target_no)) if target_no else None
-
-            if not row_index:
-                append_log(log_ws, "update_skipped", target_no or "?", changes, link,
-                           "target task not found")
-                print(f"[skip] update target #{target_no} not found")
-            elif confidence == "high":
-                src_author = msg["author"].get("global_name") or msg["author"]["username"]
-                created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
-                stamp = created_at.astimezone(JST).strftime("%m/%d %H:%M")
-                source = {"author": src_author, "link": link, "stamp": stamp}
-                applied = apply_changes_to_row(main_ws, row_index, changes, source=source)
-                append_log(log_ws, "update_auto", target_no, applied, link,
-                           j.get("reasoning", ""))
-                print(f"[UPDATE-AUTO] #{target_no}: {applied}")
-                tasks = load_tasks_compact(main_ws)
-                tasks_prompt = compact_task_list_for_prompt(tasks)
-            else:
-                # request approval
-                task_name = next((t["name"] for t in tasks if t["no"] == int(target_no)), "?")
-                proposal_text = (
-                    f"🔔 タスク更新提案 (#{target_no}「{task_name}」)\n"
-                    f"変更内容:\n{format_changes_japanese(changes)}\n"
-                    f"{APPROVE_EMOJI} 承認 / {REJECT_EMOJI} 却下 ({APPROVAL_TIMEOUT_HOURS}h以内)\n"
-                    f"元発言: {link}\n"
-                    f"判断理由: {j.get('reasoning','')}"
-                )
-                try:
-                    posted = post_channel_message(APPROVAL_CHANNEL_ID, proposal_text)
-                    add_reaction(APPROVAL_CHANNEL_ID, posted["id"], APPROVE_EMOJI)
-                    add_reaction(APPROVAL_CHANNEL_ID, posted["id"], REJECT_EMOJI)
-                    append_pending(pending_ws, posted["id"], APPROVAL_CHANNEL_ID,
-                                   int(target_no), row_index, changes, proposal_text,
-                                   mid, link)
-                    append_log(log_ws, "update_proposed", target_no, changes, link,
-                               j.get("reasoning", ""))
-                    print(f"[PROPOSE] #{target_no} awaiting approval (msg {posted['id']})")
-                except Exception as e:
-                    append_log(log_ws, "propose_error", target_no, changes, link, str(e))
-                    print(f"[propose error] #{target_no}: {e}", file=sys.stderr)
-
-        else:
-            print(f"[ignore] {mid}: {j.get('reasoning','')}")
 
         progress_id = mid
 
