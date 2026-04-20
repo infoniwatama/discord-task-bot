@@ -41,14 +41,17 @@ RECENT_REJECTIONS_LIMIT = 20
 APPROVE_EMOJI = "✅"
 REJECT_EMOJI = "❌"
 
-CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
-APPROVAL_CHANNEL_ID = os.environ.get("DISCORD_APPROVAL_CHANNEL_ID", CHANNEL_ID)
+LEGACY_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")  # used only for legacy migration
+APPROVAL_CHANNEL_ID = os.environ.get("DISCORD_APPROVAL_CHANNEL_ID", "")
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 GOOGLE_SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "タスク管理")
-GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
+GUILD_ID = os.environ["DISCORD_GUILD_ID"]
+CHANNEL_BLACKLIST = {
+    c.strip() for c in os.environ.get("DISCORD_CHANNEL_BLACKLIST", "").split(",") if c.strip()
+}
 
 STATE_SHEET = "_state"
 PENDING_SHEET = "_pending"
@@ -167,13 +170,28 @@ def discord_put(path: str) -> None:
     r.raise_for_status()
 
 
-def fetch_new_messages(after_id: str | None) -> list[dict[str, Any]]:
+def fetch_new_messages(channel_id: str, after_id: str | None) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"limit": 100}
     if after_id:
         params["after"] = after_id
-    messages = discord_get(f"/channels/{CHANNEL_ID}/messages", params=params)
+    messages = discord_get(f"/channels/{channel_id}/messages", params=params)
     messages.sort(key=lambda m: int(m["id"]))
     return messages
+
+
+def list_text_channels() -> list[dict[str, Any]]:
+    channels = discord_get(f"/guilds/{GUILD_ID}/channels")
+    # type 0 = GUILD_TEXT, type 5 = GUILD_ANNOUNCEMENT (also text-based)
+    return [c for c in channels if c.get("type") in (0, 5)]
+
+
+def fetch_latest_message_id(channel_id: str) -> str | None:
+    try:
+        recent = discord_get(f"/channels/{channel_id}/messages", params={"limit": 1})
+    except Exception as e:
+        print(f"[warn] no access to channel {channel_id}: {e}", file=sys.stderr)
+        return None
+    return recent[0]["id"] if recent else None
 
 
 def get_bot_user_id() -> str:
@@ -230,13 +248,40 @@ def get_or_create_tab(sh: gspread.Spreadsheet, name: str, header: list[str]) -> 
         return ws
 
 
-def get_last_message_id(state_ws: gspread.Worksheet) -> str | None:
-    val = state_ws.acell("B1").value
-    return val or None
+STATE_HEADER = ["channel_id", "last_message_id"]
 
 
-def set_last_message_id(state_ws: gspread.Worksheet, message_id: str) -> None:
-    state_ws.update(values=[["last_message_id", message_id]], range_name="A1:B1")
+def migrate_legacy_state(state_ws: gspread.Worksheet) -> None:
+    """Convert old single-channel state (row 1 = [last_message_id, <id>]) to the
+    per-channel schema. Safe to run on every startup — no-op if already migrated."""
+    row1 = state_ws.row_values(1)
+    if row1 == STATE_HEADER:
+        return
+    if len(row1) >= 2 and row1[0] == "last_message_id" and LEGACY_CHANNEL_ID:
+        old_id = row1[1]
+        state_ws.update(values=[STATE_HEADER], range_name="A1:B1")
+        if old_id:
+            state_ws.append_row([LEGACY_CHANNEL_ID, old_id], value_input_option="USER_ENTERED")
+        print(f"[migrate] state → per-channel schema (preserved {LEGACY_CHANNEL_ID}→{old_id})")
+        return
+    state_ws.update(values=[STATE_HEADER], range_name="A1:B1")
+
+
+def get_channel_state(state_ws: gspread.Worksheet, channel_id: str) -> str | None:
+    values = state_ws.get_all_values()
+    for row in values[1:]:
+        if len(row) >= 2 and row[0] == channel_id:
+            return row[1] or None
+    return None
+
+
+def set_channel_state(state_ws: gspread.Worksheet, channel_id: str, message_id: str) -> None:
+    values = state_ws.get_all_values()
+    for i, row in enumerate(values[1:], start=2):
+        if row and row[0] == channel_id:
+            state_ws.update_cell(i, 2, message_id)
+            return
+    state_ws.append_row([channel_id, message_id], value_input_option="USER_ENTERED")
 
 
 def find_header_row(main_ws: gspread.Worksheet) -> int:
@@ -621,122 +666,151 @@ def process_new_messages(
     reject_ws: gspread.Worksheet,
     bot_user_id: str,
 ) -> None:
-    last_id = get_last_message_id(state_ws)
-    messages = fetch_new_messages(last_id)
-    if not messages:
-        print("No new messages.")
-        return
+    migrate_legacy_state(state_ws)
+    skip_ids = set(CHANNEL_BLACKLIST)
+    if APPROVAL_CHANNEL_ID:
+        skip_ids.add(APPROVAL_CHANNEL_ID)
 
-    print(f"Fetched {len(messages)} new message(s). Last seen: {last_id}")
+    channels = [c for c in list_text_channels() if c["id"] not in skip_ids]
+    if not channels:
+        print("No channels to monitor.")
+        return
 
     tasks = load_tasks_compact(main_ws)
     rejections = load_recent_rejections(reject_ws)
     tasks_prompt = compact_task_list_for_prompt(tasks)
     rejections_prompt = rejections_for_prompt(rejections)
 
-    progress_id = last_id
     last_api_call = 0.0
+    stop_all = False
 
-    for msg in messages:
-        mid = msg["id"]
-        if msg["author"].get("bot"):
-            progress_id = mid
-            continue
-        content = (msg.get("content") or "").strip()
-        if not content:
-            progress_id = mid
-            continue
+    for ch in channels:
+        if stop_all:
+            break
+        ch_id = ch["id"]
+        ch_name = ch.get("name", ch_id)
+        last_id = get_channel_state(state_ws, ch_id)
 
-        wait = GEMINI_MIN_INTERVAL_SEC - (time.time() - last_api_call)
-        if wait > 0:
-            time.sleep(wait)
+        if last_id is None:
+            seed = fetch_latest_message_id(ch_id)
+            if seed:
+                set_channel_state(state_ws, ch_id, seed)
+                print(f"[seed] #{ch_name}: starting from {seed}")
+            continue  # no backlog processing on first encounter
 
         try:
-            j = judge_message(msg, tasks_prompt, rejections_prompt)
-            last_api_call = time.time()
-        except RateLimitError as e:
-            print(f"[rate limit] stop at {mid}: {e}", file=sys.stderr)
-            break
+            messages = fetch_new_messages(ch_id, last_id)
         except Exception as e:
-            print(f"[judge error] {mid}: {e}", file=sys.stderr)
-            progress_id = mid
+            print(f"[warn] #{ch_name} fetch failed: {e}", file=sys.stderr)
             continue
 
-        link = message_link(msg)
-        actions = j.get("actions") or [{"action": "ignore", "reasoning": "no actions"}]
-        tasks_changed = False
+        if not messages:
+            continue
 
-        for a in actions:
-            action = a.get("action")
-            if action == "create":
-                row_no = next_task_number(main_ws)
-                row = build_create_row(row_no, msg, a)
-                insert_task_at_top(main_ws, row)
-                append_log(log_ws, "create", row_no, {"name": a.get("task_name")}, link,
-                           a.get("reasoning", ""))
-                print(f"[CREATE] #{row_no}: {a.get('task_name')}")
-                tasks_changed = True
+        print(f"#{ch_name}: {len(messages)} new (after {last_id})")
 
-            elif action == "update":
-                target_no = a.get("target_task_no")
-                changes = a.get("changes") or {}
-                confidence = a.get("confidence", "low")
-                row_index = current_row_index_for_task(main_ws, int(target_no)) if target_no else None
+        progress_id = last_id
+        for msg in messages:
+            mid = msg["id"]
+            if msg["author"].get("bot"):
+                progress_id = mid
+                continue
+            content = (msg.get("content") or "").strip()
+            if not content:
+                progress_id = mid
+                continue
 
-                if not row_index:
-                    append_log(log_ws, "update_skipped", target_no or "?", changes, link,
-                               "target task not found")
-                    print(f"[skip] update target #{target_no} not found")
-                elif confidence == "high":
-                    src_author = msg["author"].get("global_name") or msg["author"]["username"]
-                    created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
-                    stamp = created_at.astimezone(JST).strftime("%m/%d %H:%M")
-                    source = {"author": src_author, "link": link, "stamp": stamp}
-                    applied = apply_changes_to_row(main_ws, row_index, changes, source=source)
-                    append_log(log_ws, "update_auto", target_no, applied, link,
+            wait = GEMINI_MIN_INTERVAL_SEC - (time.time() - last_api_call)
+            if wait > 0:
+                time.sleep(wait)
+
+            try:
+                j = judge_message(msg, tasks_prompt, rejections_prompt)
+                last_api_call = time.time()
+            except RateLimitError as e:
+                print(f"[rate limit] stop at {mid}: {e}", file=sys.stderr)
+                stop_all = True
+                break
+            except Exception as e:
+                print(f"[judge error] {mid}: {e}", file=sys.stderr)
+                progress_id = mid
+                continue
+
+            link = message_link(msg)
+            actions = j.get("actions") or [{"action": "ignore", "reasoning": "no actions"}]
+            tasks_changed = False
+
+            for a in actions:
+                action = a.get("action")
+                if action == "create":
+                    row_no = next_task_number(main_ws)
+                    row = build_create_row(row_no, msg, a)
+                    insert_task_at_top(main_ws, row)
+                    append_log(log_ws, "create", row_no, {"name": a.get("task_name")}, link,
                                a.get("reasoning", ""))
-                    print(f"[UPDATE-AUTO] #{target_no}: {applied}")
+                    print(f"[CREATE] #{row_no}: {a.get('task_name')}")
                     tasks_changed = True
-                else:
-                    task_name = next((t["name"] for t in tasks if t["no"] == int(target_no)), "?")
-                    proposal_text = (
-                        f"🔔 タスク更新提案 (#{target_no}「{task_name}」)\n"
-                        f"変更内容:\n{format_changes_japanese(changes)}\n"
-                        f"{APPROVE_EMOJI} 承認 / {REJECT_EMOJI} 却下 ({APPROVAL_TIMEOUT_HOURS}h以内)\n"
-                        f"元発言: {link}\n"
-                        f"判断理由: {a.get('reasoning','')}"
-                    )
-                    try:
-                        posted = post_channel_message(APPROVAL_CHANNEL_ID, proposal_text)
-                        add_reaction(APPROVAL_CHANNEL_ID, posted["id"], APPROVE_EMOJI)
-                        add_reaction(APPROVAL_CHANNEL_ID, posted["id"], REJECT_EMOJI)
-                        append_pending(pending_ws, posted["id"], APPROVAL_CHANNEL_ID,
-                                       int(target_no), row_index, changes, proposal_text,
-                                       mid, link)
-                        append_log(log_ws, "update_proposed", target_no, changes, link,
+
+                elif action == "update":
+                    target_no = a.get("target_task_no")
+                    changes = a.get("changes") or {}
+                    confidence = a.get("confidence", "low")
+                    row_index = current_row_index_for_task(main_ws, int(target_no)) if target_no else None
+
+                    if not row_index:
+                        append_log(log_ws, "update_skipped", target_no or "?", changes, link,
+                                   "target task not found")
+                        print(f"[skip] update target #{target_no} not found")
+                    elif confidence == "high":
+                        src_author = msg["author"].get("global_name") or msg["author"]["username"]
+                        created_at = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+                        stamp = created_at.astimezone(JST).strftime("%m/%d %H:%M")
+                        source = {"author": src_author, "link": link, "stamp": stamp}
+                        applied = apply_changes_to_row(main_ws, row_index, changes, source=source)
+                        append_log(log_ws, "update_auto", target_no, applied, link,
                                    a.get("reasoning", ""))
-                        print(f"[PROPOSE] #{target_no} awaiting approval (msg {posted['id']})")
-                    except Exception as e:
-                        append_log(log_ws, "propose_error", target_no, changes, link, str(e))
-                        print(f"[propose error] #{target_no}: {e}", file=sys.stderr)
-            else:
-                print(f"[ignore] {mid}: {a.get('reasoning','')}")
+                        print(f"[UPDATE-AUTO] #{target_no}: {applied}")
+                        tasks_changed = True
+                    else:
+                        task_name = next((t["name"] for t in tasks if t["no"] == int(target_no)), "?")
+                        proposal_text = (
+                            f"🔔 タスク更新提案 (#{target_no}「{task_name}」)\n"
+                            f"変更内容:\n{format_changes_japanese(changes)}\n"
+                            f"{APPROVE_EMOJI} 承認 / {REJECT_EMOJI} 却下 ({APPROVAL_TIMEOUT_HOURS}h以内)\n"
+                            f"元発言: {link}\n"
+                            f"判断理由: {a.get('reasoning','')}"
+                        )
+                        try:
+                            posted = post_channel_message(APPROVAL_CHANNEL_ID, proposal_text)
+                            add_reaction(APPROVAL_CHANNEL_ID, posted["id"], APPROVE_EMOJI)
+                            add_reaction(APPROVAL_CHANNEL_ID, posted["id"], REJECT_EMOJI)
+                            append_pending(pending_ws, posted["id"], APPROVAL_CHANNEL_ID,
+                                           int(target_no), row_index, changes, proposal_text,
+                                           mid, link)
+                            append_log(log_ws, "update_proposed", target_no, changes, link,
+                                       a.get("reasoning", ""))
+                            print(f"[PROPOSE] #{target_no} awaiting approval (msg {posted['id']})")
+                        except Exception as e:
+                            append_log(log_ws, "propose_error", target_no, changes, link, str(e))
+                            print(f"[propose error] #{target_no}: {e}", file=sys.stderr)
+                else:
+                    print(f"[ignore] {mid}: {a.get('reasoning','')}")
 
-        if tasks_changed:
-            tasks = load_tasks_compact(main_ws)
-            tasks_prompt = compact_task_list_for_prompt(tasks)
+            if tasks_changed:
+                tasks = load_tasks_compact(main_ws)
+                tasks_prompt = compact_task_list_for_prompt(tasks)
 
-        progress_id = mid
+            progress_id = mid
 
-    if progress_id and progress_id != last_id:
-        set_last_message_id(state_ws, progress_id)
-        print(f"Updated last_message_id -> {progress_id}")
+        if progress_id and progress_id != last_id:
+            set_channel_state(state_ws, ch_id, progress_id)
+            print(f"#{ch_name}: state → {progress_id}")
 
 
 def main() -> None:
     sh = get_sheets_client().open_by_key(SPREADSHEET_ID)
     main_ws = sh.worksheet(MAIN_SHEET_NAME)
-    state_ws = get_or_create_tab(sh, STATE_SHEET, ["last_message_id", ""])
+    state_ws = get_or_create_tab(sh, STATE_SHEET, STATE_HEADER)
     pending_ws = get_or_create_tab(sh, PENDING_SHEET, PENDING_HEADER)
     log_ws = get_or_create_tab(sh, LOG_SHEET, LOG_HEADER)
     reject_ws = get_or_create_tab(sh, REJECT_SHEET, REJECT_HEADER)
