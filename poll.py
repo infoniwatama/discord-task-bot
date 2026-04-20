@@ -90,6 +90,18 @@ SYSTEM_PROMPT = """あなたはDiscordメッセージを監視するプロジェ
 1つのメッセージに **複数の話題** が含まれることがあるので、
 各話題を個別のアクションに分解してください(create 2件+update 1件 なども可)。
 
+【チャンネル文脈(最重要)】
+- `pj_` で始まるチャンネルは **そのプロジェクト専用** です
+  例: `pj_hiro⭐` での発言は hiro プロジェクトに関する内容のみ
+- 判定対象メッセージに付与される「投稿チャンネル」と既存タスクの「チャンネル」が
+  一致するタスクだけをupdate対象候補としてください
+- 違うプロジェクトチャンネル間で混ざらないようにしてください(pj_hiroの「完了」発言で
+  pj_アモンのタスクを更新してはいけない)
+- `pj_` 以外のチャンネル(例: `一般`, `yt制作部門`, `メモ_xxx`)はプロジェクトに紐付かないため、
+  このスコープ制約は適用しません(全タスクから候補を選んで可)
+- createの `category` はチャンネル名が `pj_xxx` の場合は `xxx` を優先、
+  それ以外は内容に応じて分類(動画編集/開発/事務/調査/営業 等)
+
 【分類ルール】
 - create: 新しい依頼・作業指示(まだタスク化されていないもの)
 - update: 既存タスクの進捗報告・完了報告・期限変更・担当変更など
@@ -293,8 +305,13 @@ def find_header_row(main_ws: gspread.Worksheet) -> int:
     return 1
 
 
+import re as _re
+_CHANNEL_URL_RE = _re.compile(r"/channels/\d+/(\d+)/\d+")
+
+
 def load_tasks_compact(main_ws: gspread.Worksheet) -> list[dict[str, Any]]:
-    """Returns list of dicts for every numbered task row below the header."""
+    """Returns list of dicts for every numbered task row below the header.
+    Also extracts the source channel_id from any Discord link in the 備考 column."""
     values = main_ws.get_all_values()
     header_row = find_header_row(main_ws)
     tasks = []
@@ -305,26 +322,39 @@ def load_tasks_compact(main_ws: gspread.Worksheet) -> list[dict[str, Any]]:
             task_no = int(row[0])
         except ValueError:
             continue
+        comment = row[10] if len(row) > 10 else ""
+        m = _CHANNEL_URL_RE.search(comment)
+        channel_id = m.group(1) if m else ""
         tasks.append({
             "row_index": idx,
             "no": task_no,
             "name": row[1] if len(row) > 1 else "",
+            "category": row[2] if len(row) > 2 else "",
             "assignee": row[3] if len(row) > 3 else "",
             "status": row[7] if len(row) > 7 else "",
             "progress": row[8] if len(row) > 8 else "",
             "due": row[6] if len(row) > 6 else "",
+            "channel_id": channel_id,
         })
     return tasks
 
 
-def compact_task_list_for_prompt(tasks: list[dict[str, Any]]) -> str:
+def compact_task_list_for_prompt(
+    tasks: list[dict[str, Any]],
+    channel_name_by_id: dict[str, str] | None = None,
+) -> str:
     if not tasks:
         return "(なし)"
+    channel_name_by_id = channel_name_by_id or {}
     lines = []
     for t in tasks[:50]:  # cap to avoid token bloat; newest are at top
+        ch_name = channel_name_by_id.get(t.get("channel_id", ""), "")
+        ch_label = f" チャンネル:#{ch_name}" if ch_name else ""
         lines.append(
-            f"#{t['no']} 『{t['name']}』 担当:{t['assignee'] or '未設定'} "
-            f"状態:{t['status'] or '未着手'} 進捗:{t['progress'] or '0'}% 期限:{t['due'] or '未定'}"
+            f"#{t['no']} 『{t['name']}』 カテゴリ:{t.get('category') or '—'} "
+            f"担当:{t['assignee'] or '未設定'} "
+            f"状態:{t['status'] or '未着手'} 進捗:{t['progress'] or '0'}% "
+            f"期限:{t['due'] or '未定'}{ch_label}"
         )
     return "\n".join(lines)
 
@@ -520,6 +550,7 @@ def judge_message(
     msg: dict[str, Any],
     tasks_prompt: str,
     rejections_prompt: str,
+    channel_name: str = "",
 ) -> dict[str, Any]:
     author = msg["author"].get("global_name") or msg["author"]["username"]
     content = msg.get("content", "")
@@ -532,6 +563,7 @@ def judge_message(
 
     user_prompt = (
         f"今日の日付: {today}\n"
+        f"投稿チャンネル: #{channel_name}\n"
         f"投稿者: {author}\n"
         f"--- 既存タスク一覧(新しい順) ---\n{tasks_prompt}\n"
         f"--- 過去に却下された提案(同じ誤りを避けるための参考) ---\n{rejections_prompt}\n"
@@ -671,14 +703,16 @@ def process_new_messages(
     if APPROVAL_CHANNEL_ID:
         skip_ids.add(APPROVAL_CHANNEL_ID)
 
-    channels = [c for c in list_text_channels() if c["id"] not in skip_ids]
+    all_channels = list_text_channels()
+    channel_name_by_id = {c["id"]: c.get("name", "") for c in all_channels}
+    channels = [c for c in all_channels if c["id"] not in skip_ids]
     if not channels:
         print("No channels to monitor.")
         return
 
     tasks = load_tasks_compact(main_ws)
     rejections = load_recent_rejections(reject_ws)
-    tasks_prompt = compact_task_list_for_prompt(tasks)
+    tasks_prompt = compact_task_list_for_prompt(tasks, channel_name_by_id)
     rejections_prompt = rejections_for_prompt(rejections)
 
     last_api_call = 0.0
@@ -725,7 +759,8 @@ def process_new_messages(
                 time.sleep(wait)
 
             try:
-                j = judge_message(msg, tasks_prompt, rejections_prompt)
+                j = judge_message(msg, tasks_prompt, rejections_prompt,
+                                  channel_name=ch_name)
                 last_api_call = time.time()
             except RateLimitError as e:
                 print(f"[rate limit] stop at {mid}: {e}", file=sys.stderr)
@@ -798,7 +833,7 @@ def process_new_messages(
 
             if tasks_changed:
                 tasks = load_tasks_compact(main_ws)
-                tasks_prompt = compact_task_list_for_prompt(tasks)
+                tasks_prompt = compact_task_list_for_prompt(tasks, channel_name_by_id)
 
             progress_id = mid
 
