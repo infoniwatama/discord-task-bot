@@ -131,7 +131,11 @@ def judge_task(message: dict[str, Any]) -> dict[str, Any]:
         if text.startswith("json"):
             text = text[4:]
         text = text.strip()
-    return json.loads(text)
+    parsed = json.loads(text)
+    # Gemini occasionally wraps the object in a list
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed else {"is_task": False}
+    return parsed
 
 
 def next_row_number(ws: gspread.Worksheet) -> int:
