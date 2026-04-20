@@ -165,16 +165,40 @@ def headers_discord() -> dict[str, str]:
     return {"Authorization": f"Bot {DISCORD_TOKEN}"}
 
 
+def _respect_429(r: requests.Response) -> float | None:
+    if r.status_code == 429:
+        try:
+            retry_after = float(r.json().get("retry_after", 1.0)) + 0.2
+        except Exception:
+            retry_after = 1.0
+        return min(retry_after, 5.0)
+    return None
+
+
 def discord_get(path: str, params: dict | None = None) -> Any:
-    r = requests.get(f"{DISCORD_API}{path}", headers=headers_discord(), params=params, timeout=30)
+    for _ in range(4):
+        r = requests.get(f"{DISCORD_API}{path}", headers=headers_discord(),
+                         params=params, timeout=30)
+        delay = _respect_429(r)
+        if delay is not None:
+            time.sleep(delay)
+            continue
+        r.raise_for_status()
+        return r.json()
     r.raise_for_status()
-    return r.json()
 
 
 def discord_post(path: str, body: dict) -> Any:
-    r = requests.post(f"{DISCORD_API}{path}", headers=headers_discord(), json=body, timeout=30)
+    for _ in range(4):
+        r = requests.post(f"{DISCORD_API}{path}", headers=headers_discord(),
+                          json=body, timeout=30)
+        delay = _respect_429(r)
+        if delay is not None:
+            time.sleep(delay)
+            continue
+        r.raise_for_status()
+        return r.json()
     r.raise_for_status()
-    return r.json()
 
 
 def discord_put(path: str) -> None:
