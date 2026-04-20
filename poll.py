@@ -34,7 +34,7 @@ GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
-GEMINI_MIN_INTERVAL_SEC = 4.5
+GEMINI_MIN_INTERVAL_SEC = 7.0  # free tier is 10 RPM in practice
 JST = timezone(timedelta(hours=9))
 APPROVAL_TIMEOUT_HOURS = 24
 RECENT_REJECTIONS_LIMIT = 20
@@ -42,6 +42,7 @@ APPROVE_EMOJI = "✅"
 REJECT_EMOJI = "❌"
 
 CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
+APPROVAL_CHANNEL_ID = os.environ.get("DISCORD_APPROVAL_CHANNEL_ID", CHANNEL_ID)
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
@@ -55,8 +56,9 @@ LOG_SHEET = "_log"
 REJECT_SHEET = "_rejections"
 
 PENDING_HEADER = [
-    "approval_msg_id", "target_task_no", "target_row_index", "changes_json",
-    "proposal_text", "source_msg_id", "source_msg_link", "created_at_iso", "status",
+    "approval_msg_id", "approval_channel_id", "target_task_no", "target_row_index",
+    "changes_json", "proposal_text", "source_msg_id", "source_msg_link",
+    "created_at_iso", "status",
 ]
 LOG_HEADER = [
     "timestamp_jst", "action", "task_no", "changes_json", "source_msg_link", "note",
@@ -169,19 +171,26 @@ def get_bot_user_id() -> str:
     return me["id"]
 
 
-def post_channel_message(content: str) -> dict[str, Any]:
-    return discord_post(f"/channels/{CHANNEL_ID}/messages", {"content": content})
+def post_channel_message(channel_id: str, content: str) -> dict[str, Any]:
+    return discord_post(f"/channels/{channel_id}/messages", {"content": content})
 
 
-def add_reaction(message_id: str, emoji: str) -> None:
-    discord_put(
-        f"/channels/{CHANNEL_ID}/messages/{message_id}/reactions/{quote(emoji, safe='')}/@me"
-    )
+def add_reaction(channel_id: str, message_id: str, emoji: str) -> None:
+    url = f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}/reactions/{quote(emoji, safe='')}/@me"
+    for _ in range(3):
+        r = requests.put(url, headers=headers_discord(), timeout=30)
+        if r.status_code == 429:
+            retry_after = float(r.json().get("retry_after", 1.0)) + 0.2
+            time.sleep(min(retry_after, 5))
+            continue
+        r.raise_for_status()
+        return
+    r.raise_for_status()
 
 
-def get_reaction_user_ids(message_id: str, emoji: str) -> list[str]:
+def get_reaction_user_ids(channel_id: str, message_id: str, emoji: str) -> list[str]:
     users = discord_get(
-        f"/channels/{CHANNEL_ID}/messages/{message_id}/reactions/{quote(emoji, safe='')}"
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{quote(emoji, safe='')}"
     )
     return [u["id"] for u in users]
 
@@ -201,17 +210,14 @@ def get_sheets_client() -> gspread.Client:
 
 
 def get_or_create_tab(sh: gspread.Spreadsheet, name: str, header: list[str]) -> gspread.Worksheet:
+    """Create tab with header if missing. Never overwrite existing row 1 —
+    _state stores a key/value pair there and must not be clobbered."""
     try:
-        ws = sh.worksheet(name)
+        return sh.worksheet(name)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=name, rows=100, cols=max(2, len(header)))
         ws.update(values=[header], range_name=f"A1:{chr(64+len(header))}1")
         return ws
-    # ensure header exists
-    first_row = ws.row_values(1)
-    if first_row != header:
-        ws.update(values=[header], range_name=f"A1:{chr(64+len(header))}1")
-    return ws
 
 
 def get_last_message_id(state_ws: gspread.Worksheet) -> str | None:
@@ -223,12 +229,22 @@ def set_last_message_id(state_ws: gspread.Worksheet, message_id: str) -> None:
     state_ws.update(values=[["last_message_id", message_id]], range_name="A1:B1")
 
 
+def find_header_row(main_ws: gspread.Worksheet) -> int:
+    """Header row is the first one whose column A is exactly '#'."""
+    col_a = main_ws.col_values(1)
+    for i, v in enumerate(col_a, start=1):
+        if v.strip() == "#":
+            return i
+    return 1
+
+
 def load_tasks_compact(main_ws: gspread.Worksheet) -> list[dict[str, Any]]:
-    """Returns list of dicts for every task row (excluding header)."""
+    """Returns list of dicts for every numbered task row below the header."""
     values = main_ws.get_all_values()
+    header_row = find_header_row(main_ws)
     tasks = []
-    for idx, row in enumerate(values[1:], start=2):  # row index in sheet
-        if not row or not row[0]:
+    for idx, row in enumerate(values[header_row:], start=header_row + 1):
+        if not row or not row[0].strip():
             continue
         try:
             task_no = int(row[0])
@@ -289,6 +305,7 @@ def rejections_for_prompt(rejections: list[dict[str, Any]]) -> str:
 def append_pending(
     pending_ws: gspread.Worksheet,
     approval_msg_id: str,
+    channel_id: str,
     task_no: int,
     row_index: int,
     changes: dict,
@@ -298,8 +315,9 @@ def append_pending(
 ) -> None:
     now_iso = datetime.now(JST).isoformat()
     pending_ws.append_row(
-        [approval_msg_id, task_no, row_index, json.dumps(changes, ensure_ascii=False),
-         proposal_text, source_msg_id, source_link, now_iso, "pending"],
+        [approval_msg_id, channel_id, task_no, row_index,
+         json.dumps(changes, ensure_ascii=False), proposal_text, source_msg_id,
+         source_link, now_iso, "pending"],
         value_input_option="USER_ENTERED",
     )
 
@@ -349,19 +367,21 @@ def build_create_row(row_no: int, msg: dict[str, Any], j: dict[str, Any]) -> lis
 
 
 def insert_task_at_top(main_ws: gspread.Worksheet, row: list[Any]) -> None:
-    main_ws.insert_row(row, index=2, value_input_option="USER_ENTERED")
+    header_row = find_header_row(main_ws)
+    main_ws.insert_row(row, index=header_row + 1, value_input_option="USER_ENTERED")
 
 
 def next_task_number(main_ws: gspread.Worksheet) -> int:
     col_a = main_ws.col_values(COL["no"])
-    # header on row1; count numeric entries below
-    nums = [int(v) for v in col_a[1:] if v.strip().isdigit()]
+    header_row = find_header_row(main_ws)
+    nums = [int(v) for v in col_a[header_row:] if v.strip().isdigit()]
     return (max(nums) + 1) if nums else 1
 
 
 def current_row_index_for_task(main_ws: gspread.Worksheet, task_no: int) -> int | None:
     col_a = main_ws.col_values(COL["no"])
-    for i, v in enumerate(col_a, start=1):
+    header_row = find_header_row(main_ws)
+    for i, v in enumerate(col_a[header_row:], start=header_row + 1):
         if v.strip().isdigit() and int(v) == task_no:
             return i
     return None
@@ -476,49 +496,49 @@ def process_pending_approvals(
 ) -> None:
     values = pending_ws.get_all_values()
     now = datetime.now(JST)
+    STATUS_COL = 10  # column J in the new schema
     for i, row in enumerate(values[1:], start=2):
         if len(row) < len(PENDING_HEADER):
             continue
-        if row[8] != "pending":
+        if row[9] != "pending":
             continue
         approval_msg_id = row[0]
+        ch_id = row[1] or APPROVAL_CHANNEL_ID
         try:
-            task_no = int(row[1])
+            task_no = int(row[2])
         except ValueError:
             continue
-        target_row_index = int(row[2]) if row[2].isdigit() else None
+        target_row_index = int(row[3]) if row[3].isdigit() else None
         try:
-            changes = json.loads(row[3]) if row[3] else {}
+            changes = json.loads(row[4]) if row[4] else {}
         except json.JSONDecodeError:
             changes = {}
-        source_link = row[6]
-        created_at = datetime.fromisoformat(row[7]) if row[7] else now
+        source_link = row[7]
+        created_at = datetime.fromisoformat(row[8]) if row[8] else now
 
-        approvers = [uid for uid in get_reaction_user_ids(approval_msg_id, APPROVE_EMOJI) if uid != bot_user_id]
-        rejectors = [uid for uid in get_reaction_user_ids(approval_msg_id, REJECT_EMOJI) if uid != bot_user_id]
+        approvers = [uid for uid in get_reaction_user_ids(ch_id, approval_msg_id, APPROVE_EMOJI) if uid != bot_user_id]
+        rejectors = [uid for uid in get_reaction_user_ids(ch_id, approval_msg_id, REJECT_EMOJI) if uid != bot_user_id]
 
         if approvers:
             if target_row_index is None:
                 target_row_index = current_row_index_for_task(main_ws, task_no)
             if target_row_index:
                 applied = apply_changes_to_row(main_ws, target_row_index, changes)
-                pending_ws.update_cell(i, 9, "approved")
+                pending_ws.update_cell(i, STATUS_COL, "approved")
                 append_log(log_ws, "update_approved", task_no, applied, source_link, f"approved by {approvers[0]}")
                 print(f"[approved] #{task_no} applied: {applied}")
             else:
-                pending_ws.update_cell(i, 9, "error_row_missing")
+                pending_ws.update_cell(i, STATUS_COL, "error_row_missing")
                 append_log(log_ws, "update_error", task_no, changes, source_link, "target row not found")
         elif rejectors:
-            pending_ws.update_cell(i, 9, "rejected")
-            # snapshot of task for learning context
+            pending_ws.update_cell(i, STATUS_COL, "rejected")
             snapshot = ""
             if target_row_index is None:
                 target_row_index = current_row_index_for_task(main_ws, task_no)
             if target_row_index:
                 snap_row = main_ws.row_values(target_row_index)
                 snapshot = f"#{task_no} {snap_row[1] if len(snap_row)>1 else ''} 状態{snap_row[7] if len(snap_row)>7 else ''}"
-            # pull original source content if possible
-            source_content = row[4][:200]  # proposal_text also contains context
+            source_content = row[5][:200]  # proposal_text for learning context
             append_rejection(reject_ws, source_content, changes, snapshot,
                              reason=f"rejected by {rejectors[0]}")
             append_log(log_ws, "update_rejected", task_no, changes, source_link, f"rejected by {rejectors[0]}")
@@ -526,7 +546,7 @@ def process_pending_approvals(
         else:
             age_hours = (now - created_at).total_seconds() / 3600
             if age_hours >= APPROVAL_TIMEOUT_HOURS:
-                pending_ws.update_cell(i, 9, "expired")
+                pending_ws.update_cell(i, STATUS_COL, "expired")
                 append_log(log_ws, "update_expired", task_no, changes, source_link,
                            f"no reaction within {APPROVAL_TIMEOUT_HOURS}h")
                 print(f"[expired] #{task_no}")
@@ -640,11 +660,12 @@ def process_new_messages(
                     f"判断理由: {j.get('reasoning','')}"
                 )
                 try:
-                    posted = post_channel_message(proposal_text)
-                    add_reaction(posted["id"], APPROVE_EMOJI)
-                    add_reaction(posted["id"], REJECT_EMOJI)
-                    append_pending(pending_ws, posted["id"], int(target_no), row_index,
-                                   changes, proposal_text, mid, link)
+                    posted = post_channel_message(APPROVAL_CHANNEL_ID, proposal_text)
+                    add_reaction(APPROVAL_CHANNEL_ID, posted["id"], APPROVE_EMOJI)
+                    add_reaction(APPROVAL_CHANNEL_ID, posted["id"], REJECT_EMOJI)
+                    append_pending(pending_ws, posted["id"], APPROVAL_CHANNEL_ID,
+                                   int(target_no), row_index, changes, proposal_text,
+                                   mid, link)
                     append_log(log_ws, "update_proposed", target_no, changes, link,
                                j.get("reasoning", ""))
                     print(f"[PROPOSE] #{target_no} awaiting approval (msg {posted['id']})")
