@@ -13,17 +13,20 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import requests
-from anthropic import Anthropic
 from google.oauth2.service_account import Credentials
 import gspread
 
 
 DISCORD_API = "https://discord.com/api/v10"
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+)
 JST = timezone(timedelta(hours=9))
 
 CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 GOOGLE_SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "タスク一覧")
@@ -95,7 +98,7 @@ def fetch_new_messages(after_id: str | None) -> list[dict[str, Any]]:
     return messages
 
 
-def judge_task(client: Anthropic, message: dict[str, Any]) -> dict[str, Any]:
+def judge_task(message: dict[str, Any]) -> dict[str, Any]:
     author = message["author"].get("global_name") or message["author"]["username"]
     content = message.get("content", "")
     today = datetime.now(JST).strftime("%Y-%m-%d")
@@ -106,14 +109,23 @@ def judge_task(client: Anthropic, message: dict[str, Any]) -> dict[str, Any]:
         f"メッセージ本文:\n{content}"
     )
 
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0,
+        },
+    }
+    r = requests.post(
+        GEMINI_URL,
+        params={"key": GEMINI_API_KEY},
+        json=body,
+        timeout=30,
     )
-    text = resp.content[0].text.strip()
-    # Strip markdown fences if they slip in
+    r.raise_for_status()
+    data = r.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
     if text.startswith("```"):
         text = text.strip("`")
         if text.startswith("json"):
@@ -186,7 +198,6 @@ def main() -> None:
 
     print(f"Fetched {len(messages)} new message(s). Last seen: {last_id}")
 
-    anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
     latest_id = last_id
 
     for msg in messages:
@@ -198,7 +209,7 @@ def main() -> None:
         if not content:
             continue
         try:
-            j = judge_task(anthropic, msg)
+            j = judge_task(msg)
         except Exception as e:
             print(f"[judge error] {msg['id']}: {e}", file=sys.stderr)
             continue
