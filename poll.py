@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -17,8 +18,13 @@ from google.oauth2.service_account import Credentials
 import gspread
 
 
+class RateLimitError(Exception):
+    pass
+
+
 DISCORD_API = "https://discord.com/api/v10"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MIN_INTERVAL_SEC = 4.5  # free tier ~15 RPM — keep under
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
@@ -123,6 +129,8 @@ def judge_task(message: dict[str, Any]) -> dict[str, Any]:
         json=body,
         timeout=30,
     )
+    if r.status_code == 429:
+        raise RateLimitError(r.text)
     r.raise_for_status()
     data = r.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -202,20 +210,33 @@ def main() -> None:
 
     print(f"Fetched {len(messages)} new message(s). Last seen: {last_id}")
 
-    latest_id = last_id
+    progress_id = last_id  # advances only on successfully processed messages
+    last_api_call = 0.0
 
     for msg in messages:
-        latest_id = msg["id"]
         # Skip bot messages (including self) to avoid loops
         if msg["author"].get("bot"):
+            progress_id = msg["id"]
             continue
         content = (msg.get("content") or "").strip()
         if not content:
+            progress_id = msg["id"]
             continue
+
+        # rate limit guard
+        wait = GEMINI_MIN_INTERVAL_SEC - (time.time() - last_api_call)
+        if wait > 0:
+            time.sleep(wait)
+
         try:
             j = judge_task(msg)
+            last_api_call = time.time()
+        except RateLimitError as e:
+            print(f"[rate limit] stop at {msg['id']}: {e}", file=sys.stderr)
+            break  # keep progress_id at prior msg so we retry this one next run
         except Exception as e:
             print(f"[judge error] {msg['id']}: {e}", file=sys.stderr)
+            progress_id = msg["id"]  # unrecoverable; skip to avoid infinite loop
             continue
 
         if j.get("is_task"):
@@ -226,10 +247,11 @@ def main() -> None:
                 print(f"[sheet error] {msg['id']}: {e}", file=sys.stderr)
         else:
             print(f"[skip] {msg['id']}: not a task")
+        progress_id = msg["id"]
 
-    if latest_id and latest_id != last_id:
-        set_last_message_id(sh, latest_id)
-        print(f"Updated last_message_id -> {latest_id}")
+    if progress_id and progress_id != last_id:
+        set_last_message_id(sh, progress_id)
+        print(f"Updated last_message_id -> {progress_id}")
 
 
 if __name__ == "__main__":
